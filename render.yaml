@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: buildxp
+    runtime: python
+    plan: free
+    buildCommand: |
+      pip install -r requirements.txt
+      mkdir -p sites instance
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: FLASK_ENV
+        value: production
+      - key: SECRET_KEY
+        generateValue: true
+    disk:
+      name: buildxp-data
+      mountPath: /opt/render/project/src/sites
+      sizeGB: 1
