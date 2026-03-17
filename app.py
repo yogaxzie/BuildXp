@@ -3,6 +3,7 @@ import uuid
 import subprocess
 import signal
 import sys
+import shutil
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
@@ -10,9 +11,25 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'buildxp-secret-key-2026-secure'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///instance/database.db'
+
+# Configuration for Render
+database_url = os.environ.get('DATABASE_URL')
+if database_url:
+    # PostgreSQL on Render
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+else:
+    # Local SQLite fallback
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///instance/database.db'
+
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'buildxp-secret-key-2026-secure')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# For Render disk persistence
+SITES_DIR = os.environ.get('SITES_DIR', 'sites')
+if not os.path.isabs(SITES_DIR):
+    SITES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), SITES_DIR)
 
 db = SQLAlchemy(app)
 login_manager = LoginManager()
@@ -24,11 +41,12 @@ running_processes = {}
 
 # Database Models
 class User(UserMixin, db.Model):
+    __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
-    role = db.Column(db.String(20), default='user')  # user, vip, admin
+    role = db.Column(db.String(20), default='user')
     vip_expiry = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
@@ -43,12 +61,13 @@ class User(UserMixin, db.Model):
         return self.role == 'admin'
 
 class Project(db.Model):
+    __tablename__ = 'projects'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     project_name = db.Column(db.String(100))
-    code_type = db.Column(db.String(20))  # html, python
+    code_type = db.Column(db.String(20))
     code_content = db.Column(db.Text)
-    deploy_url = db.Column(db.String(200))
+    deploy_url = db.Column(db.String(500))
     unique_id = db.Column(db.String(50), unique=True)
     port = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -57,12 +76,13 @@ class Project(db.Model):
     user = db.relationship('User', backref='projects')
 
 class Notification(db.Model):
+    __tablename__ = 'notifications'
     id = db.Column(db.Integer, primary_key=True)
-    message = db.Column(db.String(255))
-    type = db.Column(db.String(20), default='info')  # info, vip_upgrade
+    message = db.Column(db.String(500))
+    type = db.Column(db.String(20), default='info')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_global = db.Column(db.Boolean, default=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     
     user = db.relationship('User', backref='notifications')
 
@@ -72,18 +92,17 @@ def load_user(user_id):
 
 # Initialize admin user
 def init_admin():
-    with app.app_context():
-        admin = User.query.filter_by(username='Zbuild').first()
-        if not admin:
-            admin = User(
-                username='Zbuild',
-                email='admin@buildxp.app',
-                password=generate_password_hash('252532'),
-                role='admin'
-            )
-            db.session.add(admin)
-            db.session.commit()
-            print("Admin user created: Zbuild / 252532")
+    admin = User.query.filter_by(username='Zbuild').first()
+    if not admin:
+        admin = User(
+            username='Zbuild',
+            email='admin@buildxp.app',
+            password=generate_password_hash('252532'),
+            role='admin'
+        )
+        db.session.add(admin)
+        db.session.commit()
+        print("Admin created: Zbuild / 252532")
 
 # Routes
 @app.route('/')
@@ -111,7 +130,7 @@ def register():
             email=email,
             password=generate_password_hash(password),
             role='user',
-            vip_expiry=datetime.utcnow() + timedelta(days=7)  # Free trial 7 hari
+            vip_expiry=datetime.utcnow() + timedelta(days=7)
         )
         
         db.session.add(new_user)
@@ -153,19 +172,15 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    # Get user notifications
     user_notifications = Notification.query.filter(
         (Notification.user_id == current_user.id) | (Notification.is_global == True)
     ).order_by(Notification.created_at.desc()).limit(10).all()
     
-    # Get user projects
     projects = Project.query.filter_by(user_id=current_user.id).order_by(Project.created_at.desc()).all()
     
-    # Check expiry
     now = datetime.utcnow()
     for project in projects:
         if project.expires_at < now:
-            # Stop Python process if expired
             if project.code_type == 'python' and project.unique_id in running_processes:
                 try:
                     running_processes[project.unique_id].terminate()
@@ -176,7 +191,8 @@ def dashboard():
     return render_template('dashboard.html', 
                          notifications=user_notifications, 
                          projects=projects,
-                         is_vip=current_user.is_vip())
+                         is_vip=current_user.is_vip(),
+                         now=now)
 
 @app.route('/generate', methods=['POST'])
 @login_required
@@ -189,16 +205,13 @@ def generate():
         flash('Kode tidak boleh kosong!', 'error')
         return redirect(url_for('dashboard'))
     
-    # Generate unique ID
     unique_id = uuid.uuid4().hex[:12]
     
-    # Calculate expiry
     if current_user.is_vip():
         expires_at = current_user.vip_expiry if current_user.vip_expiry else datetime.utcnow() + timedelta(days=30)
     else:
         expires_at = datetime.utcnow() + timedelta(days=7)
     
-    # Create project record
     project = Project(
         user_id=current_user.id,
         project_name=project_name,
@@ -211,15 +224,19 @@ def generate():
     db.session.add(project)
     db.session.commit()
     
-    # Deploy based on type
+    # Get base URL
+    base_url = request.url_root.rstrip('/')
+    
     if code_type == 'html':
         deploy_html(project, code_content)
-        project.deploy_url = f'/site/{unique_id}/'
+        project.deploy_url = f'{base_url}/site/{unique_id}/'
     elif code_type == 'python':
-        port = deploy_python(project, code_content)
-        if port:
-            project.port = port
-            project.deploy_url = f'http://localhost:{port}/'
+        # Python tidak bisa jalan di Render free (subprocess restricted)
+        # Fallback ke HTML preview
+        flash('Python deployment hanya tersedia di local/VPS. Menggunakan HTML preview.', 'warning')
+        project.code_type = 'html'
+        deploy_html(project, code_content)
+        project.deploy_url = f'{base_url}/site/{unique_id}/'
     
     db.session.commit()
     
@@ -228,78 +245,31 @@ def generate():
 
 def deploy_html(project, code_content):
     """Deploy HTML file to sites folder"""
-    site_dir = os.path.join('sites', project.unique_id)
+    site_dir = os.path.join(SITES_DIR, project.unique_id)
     os.makedirs(site_dir, exist_ok=True)
     
-    # Safety check - basic XSS prevention
+    # Safety check
     forbidden_tags = ['<script>alert', 'javascript:', 'onerror=', 'onload=']
+    cleaned_content = code_content
     for tag in forbidden_tags:
-        if tag in code_content.lower():
-            code_content = code_content.replace(tag, '[REMOVED]')
+        if tag in cleaned_content.lower():
+            cleaned_content = cleaned_content.replace(tag, '[REMOVED]')
     
     index_path = os.path.join(site_dir, 'index.html')
     with open(index_path, 'w', encoding='utf-8') as f:
-        f.write(code_content)
+        f.write(cleaned_content)
     
     return True
-
-def deploy_python(project, code_content):
-    """Deploy Python Flask app as subprocess"""
-    import random
-    
-    # Find available port
-    port = random.randint(10000, 20000)
-    
-    site_dir = os.path.join('sites', project.unique_id)
-    os.makedirs(site_dir, exist_ok=True)
-    
-    # Write app.py
-    app_path = os.path.join(site_dir, 'app.py')
-    
-    # Wrap user code with minimal Flask setup
-    wrapped_code = f'''
-import os
-import sys
-os.chdir('{site_dir.replace("\\\\", "\\\\\\\\")}')
-
-from flask import Flask, render_template_string
-app = Flask(__name__)
-
-# User code injection start
-{code_content}
-# User code injection end
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port={port}, debug=False, use_reloader=False)
-'''
-    
-    with open(app_path, 'w', encoding='utf-8') as f:
-        f.write(wrapped_code)
-    
-    # Start subprocess
-    try:
-        process = subprocess.Popen(
-            [sys.executable, app_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=site_dir
-        )
-        running_processes[project.unique_id] = process
-        return port
-    except Exception as e:
-        print(f"Error starting Python app: {e}")
-        return None
 
 @app.route('/site/<unique_id>/')
 @app.route('/site/<unique_id>/<path:filename>')
 def serve_site(unique_id, filename=None):
     """Serve deployed HTML sites"""
-    site_dir = os.path.join('sites', unique_id)
+    site_dir = os.path.join(SITES_DIR, unique_id)
     
     if not os.path.exists(site_dir):
         return "Site not found", 404
     
-    # Check expiry
     project = Project.query.filter_by(unique_id=unique_id).first()
     if project and project.expires_at < datetime.utcnow():
         return "Site expired", 403
@@ -342,11 +312,9 @@ def admin_upgrade():
         flash('User tidak ditemukan!', 'error')
         return redirect(url_for('admin_panel'))
     
-    # Upgrade to VIP
     user.role = 'vip'
     user.vip_expiry = datetime.utcnow() + timedelta(days=days)
     
-    # Create notification
     notif = Notification(
         message=f"User '{username}' telah menjadi pengguna VIP selama {days} hari!",
         type='vip_upgrade',
@@ -367,17 +335,7 @@ def delete_site(project_id):
     
     project = Project.query.get_or_404(project_id)
     
-    # Stop process if Python
-    if project.code_type == 'python' and project.unique_id in running_processes:
-        try:
-            running_processes[project.unique_id].terminate()
-            del running_processes[project.unique_id]
-        except:
-            pass
-    
-    # Delete files
-    import shutil
-    site_dir = os.path.join('sites', project.unique_id)
+    site_dir = os.path.join(SITES_DIR, project.unique_id)
     if os.path.exists(site_dir):
         shutil.rmtree(site_dir)
     
@@ -403,11 +361,8 @@ if __name__ == '__main__':
         db.create_all()
         init_admin()
     
-    # Create necessary directories
-    os.makedirs('sites', exist_ok=True)
+    os.makedirs(SITES_DIR, exist_ok=True)
     os.makedirs('instance', exist_ok=True)
-    os.makedirs('templates', exist_ok=True)
-    os.makedirs('static/css', exist_ok=True)
-    os.makedirs('static/js', exist_ok=True)
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
